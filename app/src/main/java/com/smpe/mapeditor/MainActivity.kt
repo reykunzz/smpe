@@ -51,6 +51,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -61,6 +62,8 @@ import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.sin
+import androidx.compose.foundation.text.selection.SelectionContainer
+import java.io.File
 import java.util.Locale
 
 // ---------- Model ----------
@@ -178,6 +181,12 @@ fun DrawScope.line3(cam: Cam, x1: Float, y1: Float, z1: Float, x2: Float, y2: Fl
         drawLine(c, Offset(p[0], p[1]), Offset(q[0], q[1]), 1f)
 }
 
+fun DrawScope.label(tm: TextMeasurer, text: String, x: Float, y: Float) {
+    // drawText throws when the text origin is outside the canvas, so skip those
+    if (x.isNaN() || y.isNaN() || x < 0f || y < 0f || x > size.width - 30f || y > size.height - 20f) return
+    drawText(tm, text, Offset(x, y), TextStyle(color = Color.White, fontSize = 10.sp, background = Color(0xAA0D1117)))
+}
+
 // ---------- Theme ----------
 private val Scheme = darkColorScheme(
     primary = Color(0xFFFF8A3D), onPrimary = Color(0xFF1B0F05),
@@ -196,7 +205,30 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        setContent { SmpeTheme { App() } }
+        val crashFile = File(filesDir, "crash.txt")
+        val old = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try { crashFile.writeText(e.stackTraceToString().take(3500)) } catch (_: Exception) {}
+            old?.uncaughtException(t, e)
+        }
+        setContent {
+            SmpeTheme {
+                var crash by remember { mutableStateOf(if (crashFile.exists()) crashFile.readText() else null) }
+                App()
+                crash?.let { msg ->
+                    AlertDialog(
+                        onDismissRequest = { crashFile.delete(); crash = null },
+                        confirmButton = { TextButton(onClick = { crashFile.delete(); crash = null }) { Text("Tutup") } },
+                        title = { Text("Laporan crash terakhir") },
+                        text = {
+                            SelectionContainer {
+                                Text(msg, fontSize = 10.sp, modifier = Modifier.verticalScroll(rememberScrollState()))
+                            }
+                        }
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -366,8 +398,7 @@ fun MapView(vm: EditorVM) {
                         if (i == vm.sel) drawCircle(Color.White, r * 3.2f, p, style = Stroke(2f * density))
                         if ((scale >= 6f && labels < 150) || i == vm.sel) {
                             labels++
-                            drawText(tm, e.model, p + Offset(r + 3f, -r - 14f),
-                                TextStyle(color = Color.White, fontSize = 10.sp, background = Color(0xAA0D1117)))
+                            label(tm, e.model, p.x + r + 3f, p.y - r - 14f)
                         }
                     }
                 }
@@ -510,8 +541,7 @@ fun View3D(vm: EditorVM) {
                 val e = vm.entries[i] as Obj
                 if (cam.project(e.x, e.y, e.z, o)) {
                     shown++
-                    drawText(tm, e.model, Offset(o[0] + 8f, o[1] - 34f),
-                        TextStyle(color = Color.White, fontSize = 10.sp, background = Color(0xAA0D1117)))
+                    label(tm, e.model, o[0] + 8f, o[1] - 34f)
                 }
             }
         }
