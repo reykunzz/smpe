@@ -83,7 +83,7 @@ private fun parseGeo(bb: ByteBuffer, g: Ck): GeoRaw? {
     if (nTex == 0) nTex = if ((flags and 0x04) != 0) 1 else if ((flags and 0x80) != 0) 2 else 0
     var uv: FloatArray? = null
     for (t in 0 until nTex) { if (t == 0) { val u0 = p; uv = FloatArray(nv * 2) { bb.getFloat(u0 + it * 4) } }; p += nv * 8 }
-    val tri = IntArray(nt * 4)
+    var tri = IntArray(nt * 4)
     for (i in 0 until nt) {
         val b = p + i * 8
         tri[i * 4] = bb.getShort(b + 2).toInt() and 0xFFFF
@@ -111,6 +111,39 @@ private fun parseGeo(bb: ByteBuffer, g: Ck): GeoRaw? {
                 }
             }
         }
+    }
+    if (nt == 0) {
+        // fallback: triangle list / strip from the BinMesh PLG extension (0x50E)
+        val acc = ArrayList<Int>()
+        bb.kids(g) { k ->
+            if (k.type == 0x03) bb.kids(k) { m ->
+                if (m.type == 0x50E) {
+                    val q = m.s
+                    val strip = (bb.getInt(q) and 1) != 0
+                    val nm = bb.getInt(q + 4)
+                    var pp = q + 12
+                    for (mi in 0 until nm) {
+                        val cnt = bb.getInt(pp); val mat = bb.getInt(pp + 4)
+                        pp += 8
+                        val base0 = pp
+                        val ix = IntArray(cnt) { bb.getInt(base0 + it * 4) }
+                        pp += cnt * 4
+                        if (strip) {
+                            for (t in 2 until cnt) {
+                                val a = ix[t - 2]; val b = ix[t - 1]; val c = ix[t]
+                                if (a == b || b == c || a == c) continue
+                                if (t % 2 == 0) { acc.add(a); acc.add(b); acc.add(c) } else { acc.add(b); acc.add(a); acc.add(c) }
+                                acc.add(mat)
+                            }
+                        } else {
+                            var t = 0
+                            while (t + 2 < cnt) { acc.add(ix[t]); acc.add(ix[t + 1]); acc.add(ix[t + 2]); acc.add(mat); t += 3 }
+                        }
+                    }
+                }
+            }
+        }
+        tri = acc.toIntArray()
     }
     return GeoRaw(nv, pos, uv, col, tri, mats)
 }
@@ -359,7 +392,8 @@ class GameData private constructor(private val fis: FileInputStream, private val
 
     private fun readIndex() {
         val h = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN); readFully(h, 0); h.flip()
-        if (h.getInt() != 0x32524556) throw IllegalStateException("gta3.img bukan format VER2 (GTA SA PC)")
+        val magic = h.getInt()
+        if (magic != 0x32524556) throw IllegalStateException("gta3.img bukan format VER2 (magic 0x" + Integer.toHexString(magic) + ")")
         val n = h.getInt()
         if (n <= 0 || n > 200000) throw IllegalStateException("Index gta3.img tidak valid")
         val t = ByteBuffer.allocate(n * 32).order(ByteOrder.LITTLE_ENDIAN); readFully(t, 8); t.flip()
@@ -433,38 +467,121 @@ class GameData private constructor(private val fis: FileInputStream, private val
         }
     }
 
+    var report: String = ""
+
+    fun diagnose(): String {
+        val sb = StringBuilder(report).append("\n")
+        val dffs = imgIndex.keys.filter { it.endsWith(".dff") && !it.startsWith("lod") }.sorted()
+        sb.append("Uji parse DFF:\n")
+        val stepN = max(1, dffs.size / 5)
+        for (n in dffs.filterIndexed { i, _ -> i % stepN == 0 }.take(5)) {
+            val b = readEntry(n) ?: continue
+            sb.append(n).append(" (").append(b.size).append(" B) ").append(inspectDff(b)).append("\n")
+            val md = try { parseDff(b) { _ -> null } } catch (e: Throwable) { null }
+            sb.append("  -> ").append(if (md == null) "GAGAL parse" else "OK: " + (md.verts.size / 12) + " vertex, " + md.parts.size + " bagian").append("\n")
+        }
+        return sb.toString()
+    }
+
     companion object {
+        @Volatile var lastReport: String = ""
+
+        private fun head(ctx: Context, f: DocumentFile, n: Int): ByteArray {
+            val b = ByteArray(n)
+            var got = 0
+            try {
+                ctx.contentResolver.openInputStream(f.uri)?.use { st ->
+                    while (got < n) { val r = st.read(b, got, n - got); if (r < 0) break; got += r }
+                }
+            } catch (e: Exception) { }
+            return b.copyOf(got)
+        }
+
         fun open(ctx: Context, tree: Uri): GameData {
-            val root = DocumentFile.fromTreeUri(ctx, tree) ?: throw IllegalStateException("Folder tidak valid")
-            var img: DocumentFile? = null
-            val ides = ArrayList<DocumentFile>()
-            fun deep(d: DocumentFile, depth: Int) {
-                for (f in d.listFiles()) {
-                    val n = f.name?.lowercase() ?: continue
-                    if (f.isDirectory) { if (depth < 5) deep(f, depth + 1) } else if (n.endsWith(".ide")) ides.add(f)
+            val rep = StringBuilder()
+            lastReport = ""
+            try {
+                val root = DocumentFile.fromTreeUri(ctx, tree) ?: throw IllegalStateException("Folder tidak valid")
+                val top = root.listFiles()
+                rep.append("Folder: ").append(root.name).append("\nIsi (").append(top.size).append("): ")
+                rep.append(top.take(40).joinToString(", ") { (it.name ?: "?") + (if (it.isDirectory) "/" else "") }).append("\n")
+                if (top.isEmpty()) throw IllegalStateException("Folder kosong atau tidak terbaca. Android 11+ memblokir Android/data; salin folder game ke penyimpanan internal (mis. Download/GTASA) lalu pilih dari sana.")
+                var img: DocumentFile? = null
+                var texdb: DocumentFile? = null
+                val ides = ArrayList<DocumentFile>()
+                val skip = setOf("audio", "movies", "text", "anim", "sfx", "fonts")
+                fun walk(d: DocumentFile, depth: Int) {
+                    for (f in d.listFiles()) {
+                        val n = f.name?.lowercase() ?: continue
+                        if (f.isDirectory) {
+                            if (n == "texdb") texdb = f else if (depth < 6 && n !in skip) walk(f, depth + 1)
+                        } else if (n == "gta3.img") { if (img == null) img = f }
+                        else if (n.endsWith(".ide")) ides.add(f)
+                    }
                 }
+                walk(root, 0)
+                rep.append("gta3.img: ").append(if (img != null) "ditemukan" else "TIDAK ditemukan").append(" | file .ide: ").append(ides.size).append("\n")
+
+                val tdb = texdb
+                if (tdb != null) {
+                    val subs = tdb.listFiles()
+                    rep.append("texdb: ").append(subs.take(12).joinToString(", ") { (it.name ?: "?") + (if (it.isDirectory) "/" else "") }).append("\n")
+                    var datF: DocumentFile? = null
+                    var txtF: DocumentFile? = null
+                    fun consider(f: DocumentFile) {
+                        val n = f.name?.lowercase() ?: return
+                        if (datF == null && n.endsWith(".dat")) datF = f
+                        if (txtF == null && n.endsWith(".txt")) txtF = f
+                    }
+                    for (sd in subs) { if (sd.isDirectory) sd.listFiles().forEach { consider(it) } else consider(sd) }
+                    datF?.let { f ->
+                        rep.append("Contoh ").append(f.name).append(" (").append(f.length()).append(" B), 48 byte awal: ")
+                            .append(head(ctx, f, 48).joinToString(" ") { String.format("%02x", it) }).append("\n")
+                    }
+                    txtF?.let { f ->
+                        rep.append("Contoh ").append(f.name).append(" awal: ")
+                            .append(String(head(ctx, f, 400), Charsets.ISO_8859_1).replace("\r", "").replace("\n", " | ")).append("\n")
+                    }
+                } else rep.append("texdb: tidak ada\n")
+
+                val image = img ?: throw IllegalStateException("gta3.img tidak ditemukan. Pilih folder game yang berisi gta3.img (lihat Diagnosa file game).")
+                val pfd = ctx.contentResolver.openFileDescriptor(image.uri, "r") ?: throw IllegalStateException("Gagal membuka gta3.img")
+                val g = GameData(FileInputStream(pfd.fileDescriptor), pfd)
+                g.readIndex()
+                val names = g.imgIndex.keys
+                rep.append("Entri gta3.img: ").append(names.size).append(" (dff ").append(names.count { it.endsWith(".dff") })
+                    .append(", txd ").append(names.count { it.endsWith(".txd") }).append(", col ").append(names.count { it.endsWith(".col") }).append(")\n")
+                rep.append("Contoh: ").append(names.take(6).joinToString(", ")).append("\n")
+                for (f in ides) ctx.contentResolver.openInputStream(f.uri)?.use { g.parseIde(it.bufferedReader().readText()) }
+                g.defList.sortBy { it.lc }
+                rep.append("Model dari IDE: ").append(g.defList.size).append("\n")
+                g.report = rep.toString()
+                return g
+            } catch (e: Exception) {
+                rep.append("ERROR: ").append(e.message).append("\n")
+                throw e
+            } finally {
+                lastReport = rep.toString()
             }
-            fun scan(d: DocumentFile, depth: Int) {
-                for (f in d.listFiles()) {
-                    val n = f.name?.lowercase() ?: continue
-                    if (f.isDirectory) {
-                        when {
-                            n == "data" -> deep(f, 0)
-                            n == "models" -> f.listFiles().firstOrNull { it.name?.lowercase() == "gta3.img" }?.let { img = it }
-                            depth < 2 && (img == null || ides.isEmpty()) -> scan(f, depth + 1)
-                        }
-                    } else if (n == "gta3.img") img = f
-                }
-            }
-            scan(root, 0)
-            val image = img ?: throw IllegalStateException("gta3.img tidak ditemukan. Pilih folder utama GTA SA (berisi folder models dan data).")
-            if (ides.isEmpty()) throw IllegalStateException("File .ide tidak ditemukan. Folder data harus ikut disalin.")
-            val pfd = ctx.contentResolver.openFileDescriptor(image.uri, "r") ?: throw IllegalStateException("Gagal membuka gta3.img")
-            val g = GameData(FileInputStream(pfd.fileDescriptor), pfd)
-            g.readIndex()
-            for (f in ides) ctx.contentResolver.openInputStream(f.uri)?.use { g.parseIde(it.bufferedReader().readText()) }
-            g.defList.sortBy { it.lc }
-            return g
         }
     }
+}
+
+fun inspectDff(data: ByteArray): String {
+    try {
+        val bb = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        val root = bb.ck(0) ?: return "chunk root tidak valid"
+        val sb = StringBuilder("root=0x" + Integer.toHexString(root.type) + " ver=0x" + Integer.toHexString(rwVer(root.ver)) + " anak=")
+        var geo = ""
+        bb.kids(root) { c ->
+            sb.append("0x").append(Integer.toHexString(c.type)).append(' ')
+            if (c.type == 0x1A) bb.kids(c) { g ->
+                if (g.type == 0x0F && geo.isEmpty()) {
+                    val st = bb.ck(g.s)
+                    if (st != null) geo = "| geo flags=0x" + Integer.toHexString(bb.getInt(st.s)) + " tri=" + bb.getInt(st.s + 4) + " vert=" + bb.getInt(st.s + 8)
+                }
+            }
+        }
+        return sb.toString() + geo
+    } catch (e: Exception) { return "error: " + e.message }
 }

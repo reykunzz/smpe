@@ -70,6 +70,7 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
     @Volatile var pitch = 0.7f
     @Volatile var dist = 150f
     @Volatile var viewDist = 500f
+    @Volatile var hideLod = false
     @Volatile var view: GLSurfaceView? = null
     @Volatile private var vpOut = FloatArray(16)
     @Volatile private var vis: List<SceneObj> = emptyList()
@@ -199,7 +200,7 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
         game.request(key) { k, md -> ready.add(k to md); view?.requestRender() }
     }
 
-    private fun draw(gm: GpuModel, m: FloatArray, tint: FloatArray?, selected: Boolean) {
+    private fun draw(gm: GpuModel, m: FloatArray, tint: FloatArray?, selected: Boolean, oc: FloatArray) {
         GLES20.glUniformMatrix4fv(uM, 1, false, m, 0)
         GLES20.glUniform1f(uSel, if (selected) 1f else 0f)
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, gm.vbo)
@@ -209,8 +210,9 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
         GLES20.glVertexAttribPointer(3, 4, GLES20.GL_FLOAT, false, 48, 32)
         for (p in gm.parts) {
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, if (p.tex != 0) p.tex else white)
-            val c = tint ?: p.col
-            GLES20.glUniform4f(uCol, c[0], c[1], c[2], 1f)
+            if (tint != null) GLES20.glUniform4f(uCol, tint[0], tint[1], tint[2], 1f)
+            else if (p.tex == 0) GLES20.glUniform4f(uCol, p.col[0] * (0.55f + 0.45f * oc[0]), p.col[1] * (0.55f + 0.45f * oc[1]), p.col[2] * (0.55f + 0.45f * oc[2]), 1f)
+            else GLES20.glUniform4f(uCol, p.col[0], p.col[1], p.col[2], 1f)
             GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, p.ibo)
             GLES20.glDrawElements(GLES20.GL_TRIANGLES, p.count, GLES20.GL_UNSIGNED_SHORT, 0)
         }
@@ -253,12 +255,12 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
             if (so.idx == s) selObj = so
             val dx = o.x - cx; val dy = o.y - cy; val dz = o.z - cz
             val dd = sqrt(dx * dx + dy * dy + dz * dz)
-            if (so.key.startsWith("lod")) { if (dd < 250f || dd > viewDist * 3f) continue } else if (dd > viewDist) continue
+            if (so.key.startsWith("lod")) { if (hideLod || dd < 250f || dd > viewDist * 3f) continue } else if (dd > viewDist) continue
             if (dx * fx + dy * fy + dz * fz < -120f) continue
             list.add(so)
             objMatrix(mm, o)
             val gm = if (models.containsKey(so.key)) models[so.key] else { request(so.key); null }
-            if (gm != null) draw(gm, mm, null, so.idx == s) else cube?.let { draw(it, mm, so.col, so.idx == s) }
+            if (gm != null) draw(gm, mm, null, so.idx == s, so.col) else cube?.let { draw(it, mm, so.col, so.idx == s, so.col) }
         }
         vis = list
 

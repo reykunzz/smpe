@@ -118,19 +118,48 @@ class EditorVM : ViewModel() {
     var gameStatus by mutableStateOf("")
     var picker by mutableStateOf(false)
     var gl: GlScene? = null
+    var diag by mutableStateOf<String?>(null)
+    var canUndo by mutableStateOf(false)
+    var canRedo by mutableStateOf(false)
+    private val undoS = ArrayList<List<Entry>>()
+    private val redoS = ArrayList<List<Entry>>()
+    private fun snapshot() {
+        undoS.add(entries.toList()); if (undoS.size > 80) undoS.removeAt(0)
+        redoS.clear(); canUndo = true; canRedo = false
+    }
+    fun undo() {
+        if (undoS.isEmpty()) return
+        redoS.add(entries.toList())
+        val s = undoS.removeAt(undoS.size - 1)
+        entries.clear(); entries.addAll(s); sel = -1; dirty = true
+        canUndo = undoS.isNotEmpty(); canRedo = true
+    }
+    fun redo() {
+        if (redoS.isEmpty()) return
+        undoS.add(entries.toList())
+        val s = redoS.removeAt(redoS.size - 1)
+        entries.clear(); entries.addAll(s); sel = -1; dirty = true
+        canRedo = redoS.isNotEmpty(); canUndo = true
+    }
     val count: Int get() = entries.count { it is Obj }
 
     fun load(text: String, name: String, u: Uri?): Boolean {
         if (text.startsWith("bnry")) return false
         entries.clear(); entries.addAll(parseIpl(text))
         fileName = name; uri = u; sel = -1; dirty = false
+        undoS.clear(); redoS.clear(); canUndo = false; canRedo = false
         return true
     }
     fun text(): String = entries.joinToString("\n") { if (it is Obj) it.line() else (it as Raw).t }
-    fun update(i: Int, o: Obj) { entries[i] = o.copy(src = null); dirty = true }
-    fun remove(i: Int) { entries.removeAt(i); sel = -1; dirty = true }
+    fun update(i: Int, o: Obj) { snapshot(); entries[i] = o.copy(src = null); dirty = true }
+    fun remove(i: Int) { snapshot(); entries.removeAt(i); sel = -1; dirty = true }
+    fun duplicate(i: Int) {
+        val o = entries.getOrNull(i) as? Obj ?: return
+        snapshot(); entries.add(i + 1, o.copy(x = o.x + 3f, src = null)); dirty = true; sel = i + 1
+    }
     fun add(model: String = "new_object", id: Int = 1337, x: Float = 0f, y: Float = 0f, z: Float = 10f): Int {
         val o = Obj(id, model, 0, x, y, z, 0f, 0f, 0f, 1f, -1)
+        snapshot()
         val last = entries.indexOfLast { it is Obj }
         dirty = true
         return if (last >= 0) { entries.add(last + 1, o); last + 1 }
@@ -312,11 +341,15 @@ fun App(vm: EditorVM = viewModel()) {
             TopAppBar(
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
                 title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Image(painterResource(R.drawable.logo), null, Modifier.size(34.dp))
+                    Spacer(Modifier.width(10.dp))
                     Column {
                         Text("SMPE", fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.primary)
                         Text(vm.fileName + if (vm.dirty) "  (belum disimpan)" else "",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                    }
                     }
                 },
                 actions = {
@@ -332,6 +365,14 @@ fun App(vm: EditorVM = viewModel()) {
                             })
                             DropdownMenuItem(text = { Text("Simpan sebagai") }, onClick = { menu = false; saveAs.launch(vm.fileName) })
                         }
+                        DropdownMenuItem(text = { Text("Urungkan") }, enabled = vm.canUndo, onClick = { menu = false; vm.undo() })
+                        DropdownMenuItem(text = { Text("Ulangi") }, enabled = vm.canRedo, onClick = { menu = false; vm.redo() })
+                        DropdownMenuItem(text = { Text("Diagnosa file game") }, onClick = {
+                            menu = false
+                            scope.launch(Dispatchers.IO) {
+                                vm.diag = vm.game?.diagnose() ?: GameData.lastReport.ifEmpty { "Folder GTA SA belum dipilih." }
+                            }
+                        })
                         DropdownMenuItem(text = { Text("Pilih folder GTA SA") }, onClick = { menu = false; pickTree.launch(null) })
                     }
                 }
@@ -370,6 +411,7 @@ fun App(vm: EditorVM = viewModel()) {
         }
         if (vm.sel in vm.entries.indices && vm.entries[vm.sel] is Obj && !(tab == 2 && vm.game != null)) EditSheet(vm)
         if (vm.picker) ModelPicker(vm)
+        vm.diag?.let { DiagDialog(vm, it) }
     }
 }
 
