@@ -76,7 +76,8 @@ private fun parseGeo(bb: ByteBuffer, g: Ck): GeoRaw? {
     val flags = bb.getInt(p); val nt = bb.getInt(p + 4); val nv = bb.getInt(p + 8)
     p += 16
     if (rwVer(g.ver) < 0x34000) p += 12
-    if ((flags and 0x01000000) != 0 || nv <= 0 || nv > 65535) return null
+    if (nv <= 0 || nv > 65535) return null
+    if ((flags and 0x01000000) != 0) return parseNativeGeo(bb, g, nv)
     var col: FloatArray? = null
     if ((flags and 0x08) != 0) { val c0 = p; col = FloatArray(nv * 4) { (bb.get(c0 + it).toInt() and 0xFF) / 255f }; p += nv * 4 }
     var nTex = (flags ushr 16) and 0xFF
@@ -113,39 +114,111 @@ private fun parseGeo(bb: ByteBuffer, g: Ck): GeoRaw? {
         }
     }
     if (nt == 0) {
-        // fallback: triangle list / strip from the BinMesh PLG extension (0x50E)
-        val acc = ArrayList<Int>()
-        bb.kids(g) { k ->
-            if (k.type == 0x03) bb.kids(k) { m ->
-                if (m.type == 0x50E) {
-                    val q = m.s
-                    val strip = (bb.getInt(q) and 1) != 0
-                    val nm = bb.getInt(q + 4)
-                    var pp = q + 12
-                    for (mi in 0 until nm) {
-                        val cnt = bb.getInt(pp); val mat = bb.getInt(pp + 4)
-                        pp += 8
-                        val base0 = pp
-                        val ix = IntArray(cnt) { bb.getInt(base0 + it * 4) }
-                        pp += cnt * 4
-                        if (strip) {
-                            for (t in 2 until cnt) {
-                                val a = ix[t - 2]; val b = ix[t - 1]; val c = ix[t]
-                                if (a == b || b == c || a == c) continue
-                                if (t % 2 == 0) { acc.add(a); acc.add(b); acc.add(c) } else { acc.add(b); acc.add(a); acc.add(c) }
-                                acc.add(mat)
-                            }
-                        } else {
-                            var t = 0
-                            while (t + 2 < cnt) { acc.add(ix[t]); acc.add(ix[t + 1]); acc.add(ix[t + 2]); acc.add(mat); t += 3 }
-                        }
-                    }
+        var bm: Ck? = null
+        bb.kids(g) { k -> if (k.type == 0x03) bb.kids(k) { m -> if (m.type == 0x50E) bm = m } }
+        val b2 = bm
+        if (b2 != null) tri = readBinMesh(bb, b2)
+    }
+    return GeoRaw(nv, pos, uv, col, tri, mats)
+}
+
+private fun readMats(bb: ByteBuffer, g: Ck): ArrayList<MatRaw> {
+    val mats = ArrayList<MatRaw>()
+    bb.kids(g) { k ->
+        if (k.type == 0x08) {
+            val s2 = bb.ck(k.s)
+            if (s2 != null) {
+                val num = bb.getInt(s2.s)
+                var q = s2.e
+                for (i in 0 until num) {
+                    val ix = bb.getInt(s2.s + 4 + i * 4)
+                    if (ix < 0 || ix >= mats.size) {
+                        val mc = bb.ck(q)
+                        if (mc != null) { mats.add(parseMaterial(bb, mc)); q = mc.e } else mats.add(MatRaw(floatArrayOf(1f, 1f, 1f, 1f), null))
+                    } else mats.add(mats[ix])
                 }
             }
         }
-        tri = acc.toIntArray()
     }
-    return GeoRaw(nv, pos, uv, col, tri, mats)
+    return mats
+}
+
+/** Bin Mesh PLG: triangle list/strip split by material. Mobile files use uint16 indices, PC uint32. */
+private fun readBinMesh(bb: ByteBuffer, m: Ck): IntArray {
+    val q = m.s
+    val strip = (bb.getInt(q) and 1) != 0
+    val nm = bb.getInt(q + 4)
+    val total = bb.getInt(q + 8)
+    val u16 = m.size < 12 + nm * 8 + total * 4
+    val acc = ArrayList<Int>()
+    var pp = q + 12
+    for (mi in 0 until nm) {
+        val cnt = bb.getInt(pp); val mat = bb.getInt(pp + 4)
+        pp += 8
+        if (cnt < 0 || cnt > 400000) break
+        val ix = IntArray(cnt)
+        for (t in 0 until cnt) ix[t] = if (u16) (bb.getShort(pp + t * 2).toInt() and 0xFFFF) else bb.getInt(pp + t * 4)
+        pp += cnt * (if (u16) 2 else 4)
+        if (strip) {
+            for (t in 2 until cnt) {
+                val a = ix[t - 2]; val b = ix[t - 1]; val c = ix[t]
+                if (a == b || b == c || a == c) continue
+                if (t % 2 == 0) { acc.add(a); acc.add(b); acc.add(c) } else { acc.add(b); acc.add(a); acc.add(c) }
+                acc.add(mat)
+            }
+        } else {
+            var t = 0
+            while (t + 2 < cnt) { acc.add(ix[t]); acc.add(ix[t + 1]); acc.add(ix[t + 2]); acc.add(mat); t += 3 }
+        }
+    }
+    return acc.toIntArray()
+}
+
+private fun compSize(type: Int): Int = when (type) { 0 -> 4; 1, 2 -> 1; 3, 4 -> 2; else -> 0 }
+
+private fun nativeComp(bb: ByteBuffer, p: Int, type: Int, norm: Boolean): Float = when (type) {
+    0 -> bb.getFloat(p)
+    1 -> { val v = bb.get(p).toInt(); if (norm) max(v / 127f, -1f) else v.toFloat() }
+    2 -> { val v = bb.get(p).toInt() and 0xFF; if (norm) v / 255f else v.toFloat() }
+    3 -> { val v = bb.getShort(p).toInt(); if (norm) max(v / 32767f, -1f) else v.toFloat() }
+    else -> { val v = bb.getShort(p).toInt() and 0xFFFF; if (norm) v / 65535f else v.toFloat() }
+}
+
+/** Mobile (OpenGL "War Drum") pre-instanced geometry: Native Data PLG 0x510 + Bin Mesh 0x50E. */
+private fun parseNativeGeo(bb: ByteBuffer, g: Ck, nv: Int): GeoRaw? {
+    var nat: Ck? = null
+    var bin: Ck? = null
+    bb.kids(g) { k -> if (k.type == 0x03) bb.kids(k) { m -> if (m.type == 0x510) nat = m else if (m.type == 0x50E) bin = m } }
+    val n = nat ?: return null
+    val b = bin ?: return null
+    val q = n.s
+    val na = bb.getInt(q)
+    if (na <= 0 || na > 12) return null
+    val stride = bb.getInt(q + 4 + 16)
+    val ds = q + 4 + na * 24
+    if (stride <= 0 || ds.toLong() + stride.toLong() * nv > n.e.toLong()) return null
+    var pos: FloatArray? = null
+    var uv: FloatArray? = null
+    var col: FloatArray? = null
+    for (a in 0 until na) {
+        val ab = q + 4 + a * 24
+        val idx = bb.getInt(ab); val type = bb.getInt(ab + 4); val norm = bb.getInt(ab + 8) != 0
+        val size = bb.getInt(ab + 12); val off = bb.getInt(ab + 20)
+        val cs = compSize(type)
+        if (cs == 0 || size < 1 || size > 4) continue
+        when (idx) {
+            0 -> if (size >= 3) pos = FloatArray(nv * 3) { nativeComp(bb, ds + (it / 3) * stride + off + (it % 3) * cs, type, norm) }
+            1 -> if (size >= 2) uv = FloatArray(nv * 2) { nativeComp(bb, ds + (it / 2) * stride + off + (it % 2) * cs, type, norm) }
+            3 -> if (size >= 3) col = FloatArray(nv * 4) {
+                val c = it % 4
+                if (c < size) nativeComp(bb, ds + (it / 4) * stride + off + c * cs, type, norm || type == 1 || type == 2) else 1f
+            }
+        }
+    }
+    val p = pos ?: return null
+    val tri = readBinMesh(bb, b)
+    if (tri.isEmpty()) return null
+    return GeoRaw(nv, p, uv, col, tri, readMats(bb, g))
 }
 
 private fun parseFrames(bb: ByteBuffer, c: Ck, worlds: ArrayList<FloatArray>, names: ArrayList<String>) {
@@ -257,7 +330,7 @@ fun parseDff(data: ByteArray, tex: (String) -> TexData?): ModelData? {
 // ---------- TXD ----------
 private val FF: Byte = 0xFF.toByte()
 
-private fun decodeDxt(bb: ByteBuffer, off: Int, w: Int, h: Int, kind: Int, out: ByteArray) {
+internal fun decodeDxt(bb: ByteBuffer, off: Int, w: Int, h: Int, kind: Int, out: ByteArray) {
     val bw = (w + 3) / 4; val bh = (h + 3) / 4
     val bs = if (kind == 1) 8 else 16
     val pal = IntArray(16); val al = IntArray(16); val tb = IntArray(8)
@@ -374,6 +447,7 @@ class GameData private constructor(private val fis: FileInputStream, private val
     private val imgIndex = HashMap<String, ImgEntry>()
     val defs = HashMap<String, ObjDef>()
     val defList = ArrayList<ObjDef>()
+    val defById = HashMap<Int, ObjDef>()
     private val txdParent = HashMap<String, String>()
     private val txds = object : LruCache<String, TxdFile>(48 * 1024) {
         override fun sizeOf(key: String, value: TxdFile): Int = max(1, value.size / 1024)
@@ -384,6 +458,10 @@ class GameData private constructor(private val fis: FileInputStream, private val
     private val models = LruCache<String, ModelData>(400)
     private val exec = Executors.newFixedThreadPool(2)
     val pending = AtomicInteger(0)
+    var idsKnown = true
+    val reasons = java.util.concurrent.ConcurrentHashMap<String, AtomicInteger>()
+    val failedNames = java.util.concurrent.ConcurrentLinkedQueue<String>()
+    private fun why(r: String) { reasons.getOrPut(r) { AtomicInteger() }.incrementAndGet() }
 
     private fun readFully(buf: ByteBuffer, pos: Long) {
         var p = pos
@@ -418,7 +496,7 @@ class GameData private constructor(private val fis: FileInputStream, private val
             when (sec) {
                 "objs", "tobj", "anim" -> if (p.size >= 3) {
                     val id = p[0].toIntOrNull()
-                    if (id != null) { val d = ObjDef(id, p[1], p[2]); if (defs.put(d.lc, d) == null) defList.add(d) }
+                    if (id != null) { val d = ObjDef(id, p[1], p[2]); defById[id] = d; if (defs.put(d.lc, d) == null) defList.add(d) }
                 }
                 "txdp" -> if (p.size >= 2) txdParent[p[0].lowercase()] = p[1].lowercase()
             }
@@ -442,17 +520,17 @@ class GameData private constructor(private val fis: FileInputStream, private val
 
     fun loadModel(key: String): ModelData? {
         models.get(key)?.let { return it }
-        val bytes = readEntry("$key.dff") ?: return null
+        val bytes = readEntry("$key.dff") ?: run { why("tidak ada di gta3.img"); return null }
         val chain = ArrayList<TxdFile>()
         var t: String? = defs[key]?.txd?.lowercase()
         var guard = 0
         while (t != null && guard++ < 4) { txd(t)?.let { chain.add(it) }; t = txdParent[t] }
         if (chain.none { it.name == "generic" }) txd("generic")?.let { chain.add(it) }
         val md = parseDff(bytes) { tn ->
-            var r: TexData? = null
-            for (x in chain) { r = texture(x, tn); if (r != null) break }
+            var r: TexData? = dbTexture(tn)
+            if (r == null) for (x in chain) { r = texture(x, tn); if (r != null) break }
             r
-        } ?: return null
+        } ?: run { why("parse DFF gagal"); return null }
         models.put(key, md)
         return md
     }
@@ -463,14 +541,55 @@ class GameData private constructor(private val fis: FileInputStream, private val
             var md: ModelData? = null
             try { md = loadModel(key) } catch (t: Throwable) { }
             pending.decrementAndGet()
+            if (md != null) okCount.incrementAndGet() else failCount.incrementAndGet()
+            if (md == null && failedNames.size < 12) failedNames.add(key)
             done(key, md)
         }
     }
+
+    val texdbs = ArrayList<TexDb>()
+    val okCount = AtomicInteger(0)
+    val failCount = AtomicInteger(0)
+    private val dbTex = object : LruCache<String, TexData>(64 * 1024) {
+        override fun sizeOf(key: String, value: TexData): Int = max(1, value.rgba.size / 1024)
+    }
+    private val dbMissing = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    fun dbTexture(name: String): TexData? {
+        if (texdbs.isEmpty()) return null
+        val k = name.lowercase()
+        dbTex.get(k)?.let { return it }
+        if (dbMissing.contains(k)) return null
+        for (db in texdbs) {
+            val t = db.get(k)
+            if (t != null) { dbTex.put(k, t); return t }
+        }
+        dbMissing.add(k)
+        return null
+    }
+
+    /** Binary stream IPLs inside gta3.img (<base>_stream<N>.ipl). base == null loads every stream file. */
+    fun streamObjects(base: String?, known: Map<Int, String>): Pair<List<Obj>, String> {
+        val names = imgIndex.keys.filter { it.endsWith(".ipl") && it.contains("_stream") && (base == null || it.startsWith(base + "_stream")) }.sorted()
+        if (names.isEmpty()) return Pair(emptyList(), "Tidak ada file " + (base ?: "*") + "_stream*.ipl di gta3.img")
+        val out = ArrayList<Obj>()
+        var noName = 0
+        for (n in names) {
+            val b = readEntry(n) ?: continue
+            val r = parseBinaryIpl(b, defById, known)
+            out.addAll(r.first); noName += r.second
+        }
+        return Pair(out, names.size.toString() + " file stream, " + out.size + " objek" + (if (noName > 0) ", " + noName + " tanpa nama (IDE tidak ada)" else ""))
+    }
+
+    fun summary(): String = defList.size.toString() + " model IDE, " + texdbs.size + " database tekstur"
 
     var report: String = ""
 
     fun diagnose(): String {
         val sb = StringBuilder(report).append("\n")
+        for (db in texdbs) sb.append(db.report(6))
+        sb.append("Alasan gagal model: ").append(reasons.entries.joinToString { it.key + "=" + it.value.get() }).append("\nContoh gagal: ").append(failedNames.joinToString(", ")).append("\n")
         val dffs = imgIndex.keys.filter { it.endsWith(".dff") && !it.startsWith("lod") }.sorted()
         sb.append("Uji parse DFF:\n")
         val stepN = max(1, dffs.size / 5)
@@ -486,17 +605,6 @@ class GameData private constructor(private val fis: FileInputStream, private val
     companion object {
         @Volatile var lastReport: String = ""
 
-        private fun head(ctx: Context, f: DocumentFile, n: Int): ByteArray {
-            val b = ByteArray(n)
-            var got = 0
-            try {
-                ctx.contentResolver.openInputStream(f.uri)?.use { st ->
-                    while (got < n) { val r = st.read(b, got, n - got); if (r < 0) break; got += r }
-                }
-            } catch (e: Exception) { }
-            return b.copyOf(got)
-        }
-
         fun open(ctx: Context, tree: Uri): GameData {
             val rep = StringBuilder()
             lastReport = ""
@@ -509,38 +617,52 @@ class GameData private constructor(private val fis: FileInputStream, private val
                 var img: DocumentFile? = null
                 var texdb: DocumentFile? = null
                 val ides = ArrayList<DocumentFile>()
+                val exts = HashMap<String, Int>()
+                val dirs = ArrayList<String>()
                 val skip = setOf("audio", "movies", "text", "anim", "sfx", "fonts")
                 fun walk(d: DocumentFile, depth: Int) {
                     for (f in d.listFiles()) {
                         val n = f.name?.lowercase() ?: continue
                         if (f.isDirectory) {
+                            if (dirs.size < 40) dirs.add(n)
                             if (n == "texdb") texdb = f else if (depth < 6 && n !in skip) walk(f, depth + 1)
-                        } else if (n == "gta3.img") { if (img == null) img = f }
-                        else if (n.endsWith(".ide")) ides.add(f)
+                        } else {
+                            val ext = n.substringAfterLast('.', "")
+                            exts[ext] = (exts[ext] ?: 0) + 1
+                            if (n == "gta3.img") { if (img == null) img = f } else if (ext == "ide") ides.add(f)
+                        }
                     }
                 }
                 walk(root, 0)
+                rep.append("Folder ditelusuri: ").append(dirs.joinToString(", ")).append("\n")
+                rep.append("Ekstensi file: ").append(exts.entries.sortedByDescending { it.value }.take(12).joinToString(", ") { it.key + "=" + it.value }).append("\n")
                 rep.append("gta3.img: ").append(if (img != null) "ditemukan" else "TIDAK ditemukan").append(" | file .ide: ").append(ides.size).append("\n")
 
+                val dbs = ArrayList<TexDb>()
                 val tdb = texdb
                 if (tdb != null) {
-                    val subs = tdb.listFiles()
-                    rep.append("texdb: ").append(subs.take(12).joinToString(", ") { (it.name ?: "?") + (if (it.isDirectory) "/" else "") }).append("\n")
-                    var datF: DocumentFile? = null
-                    var txtF: DocumentFile? = null
-                    fun consider(f: DocumentFile) {
-                        val n = f.name?.lowercase() ?: return
-                        if (datF == null && n.endsWith(".dat")) datF = f
-                        if (txtF == null && n.endsWith(".txt")) txtF = f
+                    val files = ArrayList<DocumentFile>()
+                    fun collect(d: DocumentFile, depth: Int) {
+                        for (f in d.listFiles()) { if (f.isDirectory) { if (depth < 3) collect(f, depth + 1) } else files.add(f) }
                     }
-                    for (sd in subs) { if (sd.isDirectory) sd.listFiles().forEach { consider(it) } else consider(sd) }
-                    datF?.let { f ->
-                        rep.append("Contoh ").append(f.name).append(" (").append(f.length()).append(" B), 48 byte awal: ")
-                            .append(head(ctx, f, 48).joinToString(" ") { String.format("%02x", it) }).append("\n")
+                    collect(tdb, 0)
+                    val byName = HashMap<String, DocumentFile>()
+                    for (f in files) { val n = f.name?.lowercase() ?: continue; if (!byName.containsKey(n)) byName[n] = f }
+                    rep.append("texdb: ").append(files.size).append(" file: ").append(files.take(16).joinToString(", ") { it.name ?: "?" }).append("\n")
+                    val pri = listOf("etc", "dxt", "unc", "pvr")
+                    val bases = HashMap<String, String>()
+                    val re = Regex("^(.+)\\.(etc|dxt|pvr|unc)\\.dat$")
+                    for (n in byName.keys) {
+                        val m = re.find(n) ?: continue
+                        val b = m.groupValues[1]; val fm = m.groupValues[2]
+                        val cur = bases[b]
+                        if (cur == null || pri.indexOf(fm) < pri.indexOf(cur)) bases[b] = fm
                     }
-                    txtF?.let { f ->
-                        rep.append("Contoh ").append(f.name).append(" awal: ")
-                            .append(String(head(ctx, f, 400), Charsets.ISO_8859_1).replace("\r", "").replace("\n", " | ")).append("\n")
+                    for ((b, fm) in bases) {
+                        val dat = byName["$b.$fm.dat"]; val txt = byName["$b.txt"]
+                        if (dat == null || txt == null) { rep.append("DB $b.$fm dilewati (txt/dat tidak lengkap)\n"); continue }
+                        try { dbs.add(TexDb(ctx, b, fm, dat, byName["$b.$fm.toc"], txt)); rep.append("DB $b.$fm dimuat\n") }
+                        catch (e: Exception) { rep.append("DB $b.$fm gagal: ").append(e.message).append("\n") }
                     }
                 } else rep.append("texdb: tidak ada\n")
 
@@ -548,13 +670,21 @@ class GameData private constructor(private val fis: FileInputStream, private val
                 val pfd = ctx.contentResolver.openFileDescriptor(image.uri, "r") ?: throw IllegalStateException("Gagal membuka gta3.img")
                 val g = GameData(FileInputStream(pfd.fileDescriptor), pfd)
                 g.readIndex()
+                g.texdbs.addAll(dbs)
                 val names = g.imgIndex.keys
                 rep.append("Entri gta3.img: ").append(names.size).append(" (dff ").append(names.count { it.endsWith(".dff") })
-                    .append(", txd ").append(names.count { it.endsWith(".txd") }).append(", col ").append(names.count { it.endsWith(".col") }).append(")\n")
+                    .append(", txd ").append(names.count { it.endsWith(".txd") }).append(", col ").append(names.count { it.endsWith(".col") })
+                    .append(", ide ").append(names.count { it.endsWith(".ide") }).append(", ipl ").append(names.count { it.endsWith(".ipl") }).append(")\n")
                 rep.append("Contoh: ").append(names.take(6).joinToString(", ")).append("\n")
                 for (f in ides) ctx.contentResolver.openInputStream(f.uri)?.use { g.parseIde(it.bufferedReader().readText()) }
+                for (n in names.filter { it.endsWith(".ide") }) g.readEntry(n)?.let { g.parseIde(String(it, Charsets.ISO_8859_1).replace("\u0000", "")) }
+                if (g.defList.isEmpty()) {
+                    for (n in names.filter { it.endsWith(".dff") }) { val d = ObjDef(0, n.removeSuffix(".dff"), ""); if (g.defs.put(d.lc, d) == null) g.defList.add(d) }
+                    g.idsKnown = false
+                    rep.append("IDE tidak ditemukan: daftar model diambil dari nama DFF (ID = 0, isi manual)\n")
+                }
                 g.defList.sortBy { it.lc }
-                rep.append("Model dari IDE: ").append(g.defList.size).append("\n")
+                rep.append("Model terdaftar: ").append(g.defList.size).append("\n")
                 g.report = rep.toString()
                 return g
             } catch (e: Exception) {
@@ -578,10 +708,39 @@ fun inspectDff(data: ByteArray): String {
             if (c.type == 0x1A) bb.kids(c) { g ->
                 if (g.type == 0x0F && geo.isEmpty()) {
                     val st = bb.ck(g.s)
-                    if (st != null) geo = "| geo flags=0x" + Integer.toHexString(bb.getInt(st.s)) + " tri=" + bb.getInt(st.s + 4) + " vert=" + bb.getInt(st.s + 8)
+                    if (st != null) {
+                        geo = "| geo flags=0x" + Integer.toHexString(bb.getInt(st.s)) + " tri=" + bb.getInt(st.s + 4) + " vert=" + bb.getInt(st.s + 8)
+                        val ex = StringBuilder(" ext=")
+                        bb.kids(g) { k -> if (k.type == 0x03) bb.kids(k) { m -> ex.append("0x").append(Integer.toHexString(m.type)).append(' ') } }
+                        geo += ex.toString()
+                    }
                 }
             }
         }
         return sb.toString() + geo
     } catch (e: Exception) { return "error: " + e.message }
+}
+
+/** Binary IPL ("bnry"): 40-byte instance records (pos3, rot4, id, interior flags, lod index). */
+fun parseBinaryIpl(data: ByteArray, defById: Map<Int, ObjDef>, known: Map<Int, String>): Pair<List<Obj>, Int> {
+    try {
+        if (data.size < 0x20) return Pair(emptyList(), 0)
+        val bb = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        if (bb.getInt(0) != 0x79726E62) return Pair(emptyList(), 0)
+        val n = bb.getInt(4); val off = bb.getInt(0x1C)
+        if (n < 0 || n > 100000 || off < 0 || off.toLong() + n.toLong() * 40 > data.size) return Pair(emptyList(), 0)
+        val out = ArrayList<Obj>(n)
+        var noName = 0
+        for (i in 0 until n) {
+            val p = off + i * 40
+            val x = bb.getFloat(p); val y = bb.getFloat(p + 4); val z = bb.getFloat(p + 8)
+            if (x.isNaN() || y.isNaN() || z.isNaN() || Math.abs(x) > 20000f || Math.abs(y) > 20000f) continue
+            val id = bb.getInt(p + 28)
+            val name = defById[id]?.model ?: known[id]
+            if (name == null) noName++
+            out.add(Obj(id, name ?: ("id" + id), bb.getInt(p + 32) and 0xFF, x, y, z,
+                bb.getFloat(p + 12), bb.getFloat(p + 16), bb.getFloat(p + 20), bb.getFloat(p + 24), bb.getInt(p + 36)))
+        }
+        return Pair(out, noName)
+    } catch (e: Exception) { return Pair(emptyList(), 0) }
 }

@@ -5,6 +5,8 @@ package com.smpe.mapeditor
 import android.opengl.GLSurfaceView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
@@ -21,6 +23,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -30,6 +33,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.cos
 import kotlin.math.sin
@@ -60,6 +66,9 @@ fun GlEditor(vm: EditorVM, game: GameData) {
 fun Viewport(vm: EditorVM, gl: GlScene, st: FloatArray, panMode: Boolean, setPan: (Boolean) -> Unit, modifier: Modifier) {
     val density = LocalDensity.current.density
     val pm = rememberUpdatedState(panMode)
+    val exScene = remember(vm.extra) { vm.extra.mapIndexed { i, o -> SceneObj(-(i + 2), o) } }
+    var tick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) { while (true) { delay(800); tick++ } }
     Box(modifier.clipToBounds()) {
         AndroidView(
             factory = { c ->
@@ -73,31 +82,82 @@ fun Viewport(vm: EditorVM, gl: GlScene, st: FloatArray, panMode: Boolean, setPan
             },
             modifier = Modifier.fillMaxSize(),
             update = { v ->
-                gl.scene = vm.entries.mapIndexedNotNull { i, e -> if (e is Obj) SceneObj(i, e) else null }
+                val sc = vm.entries.mapIndexedNotNull { i, e -> if (e is Obj) SceneObj(i, e) else null }
+                sc.forEachIndexed { k, so -> so.pos = k }
+                for (so in sc) { val l = so.o.lod; if (l != null && l >= 0 && l < sc.size) sc[l].isLod = true }
+                for (so in exScene) { val l = so.o.lod; if (l != null && l >= 0 && l < sc.size) sc[l].isLod = true }
+                gl.scene = sc
+                gl.extra = exScene
                 gl.sel = vm.sel
+                gl.selStream = vm.selStream
                 v.requestRender()
             }
         )
         Box(
-            Modifier.fillMaxSize()
-                .pointerInput(Unit) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        gl.dist = (gl.dist / zoom).coerceIn(5f, 6000f)
-                        if (!pm.value) {
-                            gl.yaw -= pan.x * 0.008f
-                            gl.pitch = (gl.pitch + pan.y * 0.008f).coerceIn(0.05f, 1.5f)
+            Modifier.fillMaxSize().pointerInput(Unit) {
+                fun camMove(pan: Offset) {
+                    if (!pm.value) {
+                        gl.yaw -= pan.x * 0.008f
+                        gl.pitch = (gl.pitch + pan.y * 0.008f).coerceIn(0.05f, 1.5f)
+                    } else {
+                        val k = gl.dist / (minOf(size.width, size.height) * 1.1f)
+                        val c = cos(gl.yaw); val s = sin(gl.yaw)
+                        gl.tx += -pan.x * k * c - pan.y * k * s
+                        gl.ty += -pan.x * k * s + pan.y * k * c
+                    }
+                    gl.requestRender()
+                }
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val axis = if (vm.sel >= 0) gl.hitGizmo(down.position.x, down.position.y, 44f * density) else -1
+                    var moved = false
+                    var started = false
+                    var startVal = 0f
+                    var acc = 0f
+                    var last = down.position
+                    while (true) {
+                        val ev = awaitPointerEvent()
+                        val pressed = ev.changes.filter { it.pressed }
+                        if (pressed.isEmpty()) break
+                        if (pressed.size >= 2) {
+                            moved = true
+                            val a = pressed[0]; val b = pressed[1]
+                            val span = (a.position - b.position).getDistance()
+                            val prev = (a.previousPosition - b.previousPosition).getDistance()
+                            if (prev > 1f && span > 1f) gl.dist = (gl.dist * prev / span).coerceIn(5f, 6000f)
+                            camMove((a.position + b.position) / 2f - (a.previousPosition + b.previousPosition) / 2f)
+                            a.consume(); b.consume()
                         } else {
-                            val k = gl.dist / (minOf(size.width, size.height) * 1.1f)
-                            val c = cos(gl.yaw); val s = sin(gl.yaw)
-                            gl.tx += -pan.x * k * c - pan.y * k * s
-                            gl.ty += -pan.x * k * s + pan.y * k * c
+                            val c = pressed[0]
+                            if (!moved && (c.position - down.position).getDistance() > 8f * density) moved = true
+                            if (axis >= 0) {
+                                if (moved) {
+                                    val o = vm.entries.getOrNull(vm.sel) as? Obj
+                                    if (o != null) {
+                                        if (!started) { started = true; vm.beginEdit(); startVal = if (axis == 0) o.x else if (axis == 1) o.y else o.z; acc = 0f }
+                                        acc += gl.axisDelta(axis, last.x, last.y, c.position.x, c.position.y)
+                                        var v = startVal + acc
+                                        if (vm.snap > 0f) v = Math.round(v / vm.snap) * vm.snap
+                                        vm.setAxis(vm.sel, axis, v)
+                                    }
+                                    c.consume()
+                                }
+                            } else if (moved) {
+                                camMove(c.position - c.previousPosition)
+                                c.consume()
+                            }
+                            last = c.position
                         }
+                    }
+                    if (!moved) {
+                        val i = gl.pick(down.position.x, down.position.y, 40f * density)
+                        if (i >= 0) { vm.sel = i; vm.selStream = -1 }
+                        else if (i <= -2) { vm.selStream = -(i + 2); vm.sel = -1 }
+                        else { vm.sel = -1; vm.selStream = -1 }
                         gl.requestRender()
                     }
                 }
-                .pointerInput(Unit) {
-                    detectTapGestures { tap -> vm.sel = gl.pick(tap.x, tap.y, 40f * density); gl.requestRender() }
-                }
+            }
         )
         Row(
             Modifier.align(Alignment.TopStart).fillMaxWidth().horizontalScroll(rememberScrollState()).padding(8.dp),
@@ -114,9 +174,16 @@ fun Viewport(vm: EditorVM, gl: GlScene, st: FloatArray, panMode: Boolean, setPan
             AssistChip(onClick = { vm.redo(); gl.requestRender() }, enabled = vm.canRedo, label = { Text("Ulang") })
         }
         val sel = vm.entries.getOrNull(vm.sel) as? Obj
+        val g = vm.game
+        val hud = remember(tick, vm.sel, vm.count) {
+            val ss = vm.extra.getOrNull(vm.selStream)
+            val head = if (sel != null) sel.model + "  (ID " + sel.id + ")" else if (ss != null) "stream: " + ss.model + "  (ID " + ss.id + ")" else vm.count.toString() + " objek"
+            if (g != null) head + "  |  model " + g.okCount.get() + " ok, " + g.failCount.get() + " gagal  |  tekstur " +
+                g.texdbs.sumOf { it.ok.get() } + " ok, " + g.texdbs.sumOf { it.fail.get() } + " gagal" +
+                (if (g.failCount.get() > 0) "  [" + g.reasons.entries.joinToString { it.key + " " + it.value.get() } + "]" else "") else head
+        }
         Surface(Modifier.align(Alignment.BottomStart).padding(8.dp), shape = RoundedCornerShape(10.dp), color = Color(0xCC0D1117)) {
-            Text(if (sel != null) "${sel.model}  (ID ${sel.id})" else "${vm.count} objek",
-                Modifier.padding(horizontal = 10.dp, vertical = 5.dp), fontSize = 11.sp, color = Color.White)
+            Text(hud, Modifier.padding(horizontal = 10.dp, vertical = 5.dp), fontSize = 11.sp, color = Color.White)
         }
     }
 }
@@ -154,6 +221,19 @@ fun Panel(vm: EditorVM, gl: GlScene, st: FloatArray, modifier: Modifier) {
     var step by remember { mutableFloatStateOf(1f) }
     var viewDist by remember { mutableFloatStateOf(gl.viewDist) }
     var hideLod by remember { mutableStateOf(gl.hideLod) }
+    val scope = rememberCoroutineScope()
+    fun loadStream(all: Boolean) {
+        val g = vm.game ?: return
+        vm.streamNote = "Memuat stream..."
+        val base = if (all) null else vm.fileName.lowercase().removeSuffix(".ipl")
+        val known = HashMap<Int, String>()
+        for (e in vm.entries) if (e is Obj) known[e.id] = e.model
+        scope.launch(Dispatchers.IO) {
+            val r = g.streamObjects(base, known)
+            vm.extra = r.first; vm.streamNote = r.second
+            gl.requestRender()
+        }
+    }
     Column(
         modifier.background(MaterialTheme.colorScheme.surface).verticalScroll(rememberScrollState()).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -170,12 +250,30 @@ fun Panel(vm: EditorVM, gl: GlScene, st: FloatArray, modifier: Modifier) {
                     Text("ID ${o.id}", style = MaterialTheme.typography.labelMedium)
                 }
                 Text(String.format(Locale.US, "X %.2f   Y %.2f   Z %.2f", o.x, o.y, o.z), style = MaterialTheme.typography.bodySmall)
+                Text("Seret panah merah (X), hijau (Y), biru (Z) di layar 3D untuk menggeser objek.", style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        val sobj = vm.extra.getOrNull(vm.selStream)
+        if (sobj != null) {
+            SectionCard("OBJEK STREAM (DILIHAT SAJA)") {
+                Text(sobj.model + "  (ID " + sobj.id + ")", fontWeight = FontWeight.Bold)
+                Text(String.format(Locale.US, "X %.2f   Y %.2f   Z %.2f", sobj.x, sobj.y, sobj.z), style = MaterialTheme.typography.bodySmall)
+                Button(onClick = { vm.adoptStream(); gl.requestRender() }, shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+                    Text("Salin ke IPL agar bisa diedit")
+                }
+                Text("Objek aslinya tetap ada di stream, jadi hasilnya objek tambahan.", style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         if (o != null) {
             SectionCard("GERAKKAN") {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     for (s in listOf(0.1f, 1f, 5f, 20f)) FilterChip(selected = step == s, onClick = { step = s }, label = { Text(s.toString()) })
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Snap seret:", style = MaterialTheme.typography.labelMedium)
+                    for (s in listOf(0f, 0.5f, 1f, 5f)) FilterChip(selected = vm.snap == s, onClick = { vm.snap = s }, label = { Text(if (s == 0f) "Off" else s.toString()) })
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     Nudge("X-", Modifier.weight(1f)) { vm.update(i, o.copy(x = o.x - step)) }
@@ -220,6 +318,15 @@ fun Panel(vm: EditorVM, gl: GlScene, st: FloatArray, modifier: Modifier) {
                 Nudge("Hapus", Modifier.weight(1f)) { vm.remove(i) }
             }
         }
+        SectionCard("IPL STREAM (DETAIL PETA)") {
+            Text(vm.streamNote.ifEmpty { "IPL teks hanya memuat sebagian objek (banyak LOD). Detail bangunan ada di file stream biner dalam gta3.img. Hanya untuk dilihat, tidak ikut disimpan." },
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Nudge("Stream ini", Modifier.weight(1f)) { loadStream(false) }
+                Nudge("Semua (berat)", Modifier.weight(1f)) { loadStream(true) }
+                Nudge("Kosongkan", Modifier.weight(1f)) { vm.extra = emptyList(); vm.streamNote = ""; gl.requestRender() }
+            }
+        }
         SectionCard("ADEGAN") {
             Button(onClick = { vm.picker = true }, shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) { Text("Tambah objek") }
             Text("Jarak pandang: ${viewDist.toInt()} m", style = MaterialTheme.typography.labelMedium)
@@ -248,7 +355,7 @@ fun ModelPicker(vm: EditorVM) {
                 val key = q.trim().lowercase()
                 val res = if (g == null || key.isEmpty()) emptyList() else g.defList.filter { it.lc.contains(key) || it.id.toString() == key }.take(60)
                 if (key.isEmpty()) Text(
-                    if (g != null && g.defList.isEmpty()) "Daftar model kosong (file .ide tidak ditemukan)." else "Ketik nama model, misalnya lamppost.",
+                    if (g != null && !g.idsKnown) "File .ide tidak ditemukan: daftar dari nama model, ID = 0. Ubah ID lewat Edit nilai." else "Ketik nama model, misalnya lamppost.",
                     Modifier.padding(top = 10.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 LazyColumn(Modifier.heightIn(max = 320.dp)) {
                     items(res) { d ->
@@ -289,7 +396,7 @@ fun BoxScope.GamePrompt(vm: EditorVM, onPick: () -> Unit) {
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Tampilkan model GTA asli", fontWeight = FontWeight.Bold)
-            Text("Pilih folder game yang berisi gta3.img dan folder data. Di Android 11+ folder Android/data tidak bisa dipilih, jadi salin dulu ke Download/GTASA.",
+            Text("Pilih folder game (berisi gta3.img, data, dan texdb). Mendukung GTA SA mobile (tekstur dari texdb) maupun PC. Di Android 11+ folder Android/data tidak bisa dipilih, salin dulu ke Download/GTASA.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (vm.gameStatus.isNotEmpty()) Text(vm.gameStatus, style = MaterialTheme.typography.labelSmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

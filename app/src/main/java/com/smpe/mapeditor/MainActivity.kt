@@ -119,6 +119,10 @@ class EditorVM : ViewModel() {
     var picker by mutableStateOf(false)
     var gl: GlScene? = null
     var diag by mutableStateOf<String?>(null)
+    var selStream by mutableIntStateOf(-1)
+    var snap by mutableFloatStateOf(0f)
+    var extra by mutableStateOf<List<Obj>>(emptyList())
+    var streamNote by mutableStateOf("")
     var canUndo by mutableStateOf(false)
     var canRedo by mutableStateOf(false)
     private val undoS = ArrayList<List<Entry>>()
@@ -148,11 +152,26 @@ class EditorVM : ViewModel() {
         entries.clear(); entries.addAll(parseIpl(text))
         fileName = name; uri = u; sel = -1; dirty = false
         undoS.clear(); redoS.clear(); canUndo = false; canRedo = false
+        extra = emptyList(); streamNote = ""; selStream = -1
         return true
     }
     fun text(): String = entries.joinToString("\n") { if (it is Obj) it.line() else (it as Raw).t }
     fun update(i: Int, o: Obj) { snapshot(); entries[i] = o.copy(src = null); dirty = true }
     fun remove(i: Int) { snapshot(); entries.removeAt(i); sel = -1; dirty = true }
+    fun beginEdit() { snapshot() }
+    fun setAxis(i: Int, axis: Int, v: Float) {
+        val o = entries.getOrNull(i) as? Obj ?: return
+        entries[i] = when (axis) { 0 -> o.copy(x = v, src = null); 1 -> o.copy(y = v, src = null); else -> o.copy(z = v, src = null) }
+        dirty = true
+    }
+    /** Copy the selected (view-only) stream object into the editable IPL. */
+    fun adoptStream() {
+        val o = extra.getOrNull(selStream) ?: return
+        val n = add(o.model, o.id, o.x, o.y, o.z)
+        val e = entries[n] as Obj
+        entries[n] = e.copy(interior = o.interior, rx = o.rx, ry = o.ry, rz = o.rz, rw = o.rw, lod = -1, src = null)
+        selStream = -1; sel = n
+    }
     fun duplicate(i: Int) {
         val o = entries.getOrNull(i) as? Obj ?: return
         snapshot(); entries.add(i + 1, o.copy(x = o.x + 3f, src = null)); dirty = true; sel = i + 1
@@ -313,8 +332,8 @@ fun App(vm: EditorVM = viewModel()) {
             try {
                 val g = GameData.open(ctx, u)
                 vm.game = g
-                vm.gameStatus = "${g.defList.size} model GTA SA siap"
-                say("Data GTA SA siap: ${g.defList.size} model")
+                vm.gameStatus = g.summary()
+                say("Data GTA SA siap: " + g.summary())
             } catch (e: Exception) {
                 vm.gameStatus = "Gagal: ${e.message}"
                 say("Gagal memuat data GTA: ${e.message}")
@@ -370,7 +389,7 @@ fun App(vm: EditorVM = viewModel()) {
                         DropdownMenuItem(text = { Text("Diagnosa file game") }, onClick = {
                             menu = false
                             scope.launch(Dispatchers.IO) {
-                                vm.diag = vm.game?.diagnose() ?: GameData.lastReport.ifEmpty { "Folder GTA SA belum dipilih." }
+                                vm.diag = (vm.game?.diagnose() ?: GameData.lastReport.ifEmpty { "Folder GTA SA belum dipilih." }) + "\nGL: " + (vm.gl?.glLog?.ifEmpty { "ok" } ?: "belum dibuat")
                             }
                         })
                         DropdownMenuItem(text = { Text("Pilih folder GTA SA") }, onClick = { menu = false; pickTree.launch(null) })

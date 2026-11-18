@@ -19,6 +19,8 @@ import kotlin.math.sqrt
 
 class SceneObj(val idx: Int, val o: Obj) {
     val key = o.model.lowercase()
+    @Volatile var isLod = key.startsWith("lod")
+    var pos = -1
     val col = modelColor(o.model).let { floatArrayOf(it.red, it.green, it.blue) }
 }
 
@@ -62,6 +64,7 @@ private const val LFS = "precision mediump float; uniform vec4 uCol; void main()
 
 class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
     @Volatile var scene: List<SceneObj> = emptyList()
+    @Volatile var extra: List<SceneObj> = emptyList()
     @Volatile var sel = -1
     @Volatile var tx = 0f
     @Volatile var ty = 0f
@@ -71,6 +74,11 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
     @Volatile var dist = 150f
     @Volatile var viewDist = 500f
     @Volatile var hideLod = false
+    @Volatile var glLog = ""
+    @Volatile var selStream = -1
+    @Volatile private var gzPos = FloatArray(3)
+    @Volatile private var gzLen = 0f
+    @Volatile private var gzOn = false
     @Volatile var view: GLSurfaceView? = null
     @Volatile private var vpOut = FloatArray(16)
     @Volatile private var vis: List<SceneObj> = emptyList()
@@ -94,11 +102,18 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
     fun requestRender() { view?.requestRender() }
 
     private fun program(vs: String, fs: String, attrs: List<String>): Int {
-        fun sh(type: Int, src: String): Int { val s = GLES20.glCreateShader(type); GLES20.glShaderSource(s, src); GLES20.glCompileShader(s); return s }
+        fun sh(type: Int, src: String): Int {
+            val s = GLES20.glCreateShader(type); GLES20.glShaderSource(s, src); GLES20.glCompileShader(s)
+            val st = IntArray(1); GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, st, 0)
+            if (st[0] == 0) glLog += "shader gagal: " + GLES20.glGetShaderInfoLog(s) + "\n"
+            return s
+        }
         val p = GLES20.glCreateProgram()
         GLES20.glAttachShader(p, sh(GLES20.GL_VERTEX_SHADER, vs)); GLES20.glAttachShader(p, sh(GLES20.GL_FRAGMENT_SHADER, fs))
         attrs.forEachIndexed { i, n -> GLES20.glBindAttribLocation(p, i, n) }
         GLES20.glLinkProgram(p)
+        val ls = IntArray(1); GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, ls, 0)
+        if (ls[0] == 0) glLog += "link gagal: " + GLES20.glGetProgramInfoLog(p) + "\n"
         return p
     }
 
@@ -241,6 +256,27 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
         val fx = (tx - cx) / d; val fy = (ty - cy) / d; val fz = (tz - cz) / d
 
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+        // ground grid
+        GLES20.glUseProgram(lprog)
+        GLES20.glUniformMatrix4fv(luVP, 1, false, vp, 0)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        for (a in 1..3) GLES20.glDisableVertexAttribArray(a)
+        GLES20.glEnableVertexAttribArray(0)
+        run {
+            val gstep = Math.pow(10.0, Math.floor(Math.log10((d / 4f).toDouble()))).toFloat()
+            val gx0 = Math.floor((tx / gstep).toDouble()).toFloat() * gstep
+            val gy0 = Math.floor((ty / gstep).toDouble()).toFloat() * gstep
+            val pts = FloatArray(42 * 6)
+            var k = 0
+            for (i in -10..10) {
+                pts[k++] = gx0 + i * gstep; pts[k++] = gy0 - 10 * gstep; pts[k++] = tz
+                pts[k++] = gx0 + i * gstep; pts[k++] = gy0 + 10 * gstep; pts[k++] = tz
+                pts[k++] = gx0 - 10 * gstep; pts[k++] = gy0 + i * gstep; pts[k++] = tz
+                pts[k++] = gx0 + 10 * gstep; pts[k++] = gy0 + i * gstep; pts[k++] = tz
+            }
+            GLES20.glLineWidth(1f)
+            lines(pts, 0.28f, 0.42f, 0.62f)
+        }
         GLES20.glUseProgram(prog)
         GLES20.glUniformMatrix4fv(uVP, 1, false, vp, 0)
         GLES20.glUniform1i(uTex, 0)
@@ -250,18 +286,41 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
         val list = ArrayList<SceneObj>()
         var selObj: SceneObj? = null
         val s = sel
-        for (so in scene) {
+        val sc = scene
+        val ex = extra
+        // a visible detail object (lod index >= 0) hides the LOD instance it points to
+        val hidden = BooleanArray(sc.size)
+        for (so in sc) {
+            val l = so.o.lod
+            if (l != null && l >= 0 && l < hidden.size && !so.isLod) {
+                val dx = so.o.x - cx; val dy = so.o.y - cy; val dz = so.o.z - cz
+                if (sqrt(dx * dx + dy * dy + dz * dz) < viewDist) hidden[l] = true
+            }
+        }
+        for (so in ex) {
+            val l = so.o.lod
+            if (l != null && l >= 0 && l < hidden.size) {
+                val dx = so.o.x - cx; val dy = so.o.y - cy; val dz = so.o.z - cz
+                if (sqrt(dx * dx + dy * dy + dz * dz) < viewDist) hidden[l] = true
+            }
+        }
+        fun handle(so: SceneObj) {
             val o = so.o
-            if (so.idx == s) selObj = so
+            val isSel = (so.idx >= 0 && so.idx == s) || (so.idx <= -2 && -(so.idx + 2) == selStream)
+            if (isSel) selObj = so
             val dx = o.x - cx; val dy = o.y - cy; val dz = o.z - cz
             val dd = sqrt(dx * dx + dy * dy + dz * dz)
-            if (so.key.startsWith("lod")) { if (hideLod || dd < 250f || dd > viewDist * 3f) continue } else if (dd > viewDist) continue
-            if (dx * fx + dy * fy + dz * fz < -120f) continue
+            if (so.isLod) {
+                if (hideLod || (so.pos >= 0 && so.pos < hidden.size && hidden[so.pos]) || dd > viewDist * 3f) return
+            } else if (dd > viewDist) return
+            if (dx * fx + dy * fy + dz * fz < -120f) return
             list.add(so)
             objMatrix(mm, o)
             val gm = if (models.containsKey(so.key)) models[so.key] else { request(so.key); null }
-            if (gm != null) draw(gm, mm, null, so.idx == s, so.col) else cube?.let { draw(it, mm, so.col, so.idx == s, so.col) }
+            if (gm != null) draw(gm, mm, null, isSel, so.col) else cube?.let { draw(it, mm, so.col, isSel, so.col) }
         }
+        for (so in sc) handle(so)
+        for (so in ex) handle(so)
         vis = list
 
         val so = selObj
@@ -291,7 +350,8 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
             lines(floatArrayOf(o.x, o.y, o.z, o.x + len, o.y, o.z), 1f, 0.2f, 0.2f)
             lines(floatArrayOf(o.x, o.y, o.z, o.x, o.y + len, o.z), 0.2f, 1f, 0.2f)
             lines(floatArrayOf(o.x, o.y, o.z, o.x, o.y, o.z + len), 0.3f, 0.5f, 1f)
-        }
+            gzPos = floatArrayOf(o.x, o.y, o.z); gzLen = len; gzOn = so.idx >= 0
+        } else gzOn = false
         if (game.pending.get() > 0 || !ready.isEmpty()) view?.requestRender()
     }
 
@@ -308,6 +368,42 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
             }
         }
         return t0
+    }
+
+    private fun toScreen(vp: FloatArray, x: Float, y: Float, z: Float): FloatArray? {
+        val cw = vp[3] * x + vp[7] * y + vp[11] * z + vp[15]
+        if (cw <= 0.05f) return null
+        val sx = ((vp[0] * x + vp[4] * y + vp[8] * z + vp[12]) / cw * 0.5f + 0.5f) * vw
+        val sy = (1f - ((vp[1] * x + vp[5] * y + vp[9] * z + vp[13]) / cw * 0.5f + 0.5f)) * vh
+        return floatArrayOf(sx, sy)
+    }
+
+    /** Which gizmo axis (0=X, 1=Y, 2=Z) is under the touch point, or -1. */
+    fun hitGizmo(px: Float, py: Float, slop: Float): Int {
+        if (!gzOn) return -1
+        val vp = vpOut; val p = gzPos; val l = gzLen
+        val o = toScreen(vp, p[0], p[1], p[2]) ?: return -1
+        var best = -1; var bd = slop
+        for (a in 0..2) {
+            val e = toScreen(vp, p[0] + (if (a == 0) l else 0f), p[1] + (if (a == 1) l else 0f), p[2] + (if (a == 2) l else 0f)) ?: continue
+            val dx = e[0] - o[0]; val dy = e[1] - o[1]; val len2 = dx * dx + dy * dy
+            var t = if (len2 > 1e-3f) ((px - o[0]) * dx + (py - o[1]) * dy) / len2 else 0f
+            t = t.coerceIn(0f, 1f)
+            val cx = o[0] + dx * t; val cy = o[1] + dy * t
+            val d = sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy))
+            if (d < bd) { bd = d; best = a }
+        }
+        return best
+    }
+
+    /** World distance moved along an axis for a screen drag from (x0,y0) to (x1,y1). */
+    fun axisDelta(axis: Int, x0: Float, y0: Float, x1: Float, y1: Float): Float {
+        val vp = vpOut; val p = gzPos; val l = gzLen
+        val o = toScreen(vp, p[0], p[1], p[2]) ?: return 0f
+        val e = toScreen(vp, p[0] + (if (axis == 0) l else 0f), p[1] + (if (axis == 1) l else 0f), p[2] + (if (axis == 2) l else 0f)) ?: return 0f
+        val sx = e[0] - o[0]; val sy = e[1] - o[1]; val s2 = sx * sx + sy * sy
+        if (s2 < 1f) return 0f
+        return ((x1 - x0) * sx + (y1 - y0) * sy) / s2 * l
     }
 
     /** Returns the entry index of the object under the touch point, or -1. Call from the main thread. */
