@@ -64,6 +64,9 @@ import kotlin.math.pow
 import kotlin.math.sin
 import androidx.compose.foundation.text.selection.SelectionContainer
 import java.io.File
+import android.content.Context
+import androidx.compose.material.icons.filled.MoreVert
+import kotlinx.coroutines.Dispatchers
 import java.util.Locale
 
 // ---------- Model ----------
@@ -111,6 +114,10 @@ class EditorVM : ViewModel() {
     var uri by mutableStateOf<Uri?>(null)
     var sel by mutableIntStateOf(-1)
     var dirty by mutableStateOf(false)
+    var game by mutableStateOf<GameData?>(null)
+    var gameStatus by mutableStateOf("")
+    var picker by mutableStateOf(false)
+    var gl: GlScene? = null
     val count: Int get() = entries.count { it is Obj }
 
     fun load(text: String, name: String, u: Uri?): Boolean {
@@ -122,8 +129,8 @@ class EditorVM : ViewModel() {
     fun text(): String = entries.joinToString("\n") { if (it is Obj) it.line() else (it as Raw).t }
     fun update(i: Int, o: Obj) { entries[i] = o.copy(src = null); dirty = true }
     fun remove(i: Int) { entries.removeAt(i); sel = -1; dirty = true }
-    fun add(): Int {
-        val o = Obj(1337, "new_object", 0, 0f, 0f, 10f, 0f, 0f, 0f, 1f, -1)
+    fun add(model: String = "new_object", id: Int = 1337, x: Float = 0f, y: Float = 0f, z: Float = 10f): Int {
+        val o = Obj(id, model, 0, x, y, z, 0f, 0f, 0f, 1f, -1)
         val last = entries.indexOfLast { it is Obj }
         dirty = true
         return if (last >= 0) { entries.add(last + 1, o); last + 1 }
@@ -249,6 +256,7 @@ fun App(vm: EditorVM = viewModel()) {
     val snack = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     var tab by remember { mutableIntStateOf(0) }
+    val prefs = remember { ctx.getSharedPreferences("smpe", Context.MODE_PRIVATE) }
     fun say(m: String) { scope.launch { snack.showSnackbar(m) } }
 
     val open = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u: Uri? ->
@@ -269,6 +277,33 @@ fun App(vm: EditorVM = viewModel()) {
         if (u != null) write(u)
     }
 
+    fun loadGame(u: Uri) {
+        vm.gameStatus = "Memuat data GTA SA..."
+        say("Memuat data GTA SA...")
+        scope.launch(Dispatchers.IO) {
+            try {
+                val g = GameData.open(ctx, u)
+                vm.game = g
+                vm.gameStatus = "${g.defList.size} model GTA SA siap"
+                say("Data GTA SA siap: ${g.defList.size} model")
+            } catch (e: Exception) {
+                vm.gameStatus = "Gagal: ${e.message}"
+                say("Gagal memuat data GTA: ${e.message}")
+            }
+        }
+    }
+    val pickTree = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { u: Uri? ->
+        if (u != null) {
+            try { ctx.contentResolver.takePersistableUriPermission(u, 1) } catch (_: Exception) {}
+            prefs.edit().putString("tree", u.toString()).apply()
+            loadGame(u)
+        }
+    }
+    LaunchedEffect(Unit) {
+        val saved = prefs.getString("tree", null)
+        if (saved != null && vm.game == null) loadGame(Uri.parse(saved))
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -285,13 +320,19 @@ fun App(vm: EditorVM = viewModel()) {
                     }
                 },
                 actions = {
+                    var menu by remember { mutableStateOf(false) }
                     TextButton(onClick = { open.launch(arrayOf("*/*")) }) { Text("Buka") }
-                    if (vm.entries.isNotEmpty()) {
-                        TextButton(onClick = {
-                            val u = vm.uri
-                            if (u != null) write(u) else saveAs.launch(vm.fileName)
-                        }) { Text("Simpan") }
-                        TextButton(onClick = { saveAs.launch(vm.fileName) }) { Text("Simpan sebagai") }
+                    IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "Menu") }
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        if (vm.entries.isNotEmpty()) {
+                            DropdownMenuItem(text = { Text("Simpan") }, onClick = {
+                                menu = false
+                                val u = vm.uri
+                                if (u != null) write(u) else saveAs.launch(vm.fileName)
+                            })
+                            DropdownMenuItem(text = { Text("Simpan sebagai") }, onClick = { menu = false; saveAs.launch(vm.fileName) })
+                        }
+                        DropdownMenuItem(text = { Text("Pilih folder GTA SA") }, onClick = { menu = false; pickTree.launch(null) })
                     }
                 }
             )
@@ -307,7 +348,7 @@ fun App(vm: EditorVM = viewModel()) {
             }
         },
         floatingActionButton = {
-            if (vm.entries.isNotEmpty()) ExtendedFloatingActionButton(
+            if (vm.entries.isNotEmpty() && !(tab == 2 && vm.game != null)) ExtendedFloatingActionButton(
                 onClick = { vm.sel = vm.add() },
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary,
@@ -320,10 +361,15 @@ fun App(vm: EditorVM = viewModel()) {
                 vm.entries.isEmpty() -> Empty { open.launch(arrayOf("*/*")) }
                 tab == 0 -> MapView(vm)
                 tab == 1 -> ListView(vm)
-                else -> View3D(vm)
+                else -> {
+                    val g = vm.game
+                    if (g != null) GlEditor(vm, g)
+                    else Box(Modifier.fillMaxSize()) { View3D(vm); GamePrompt(vm) { pickTree.launch(null) } }
+                }
             }
         }
-        if (vm.sel in vm.entries.indices && vm.entries[vm.sel] is Obj) EditSheet(vm)
+        if (vm.sel in vm.entries.indices && vm.entries[vm.sel] is Obj && !(tab == 2 && vm.game != null)) EditSheet(vm)
+        if (vm.picker) ModelPicker(vm)
     }
 }
 
