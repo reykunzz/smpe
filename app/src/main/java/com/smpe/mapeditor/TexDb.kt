@@ -173,45 +173,50 @@ class TexDb(ctx: Context, val base: String, val fmt: String, dat: DocumentFile, 
 
     private fun fail(msg: String): TexData? { note = msg; return null }
 
+    private fun mipChain(w: Int, h: Int, noMips: Boolean): List<IntArray> {
+        val mips = ArrayList<IntArray>()
+        var mw = w; var mh = h
+        while (true) { mips.add(intArrayOf(mw, mh)); if (noMips || (mw == 1 && mh == 1)) break; mw = max(1, mw / 2); mh = max(1, mh / 2) }
+        return mips
+    }
+
     private fun decode(idx: Int, e: DbEntry): TexData? {
         val offs = offsets ?: offsetsOrBuild() ?: return fail("offset tidak tersedia (toc tidak cocok)")
         val off = offs.getOrNull(idx)?.toLong() ?: return fail("offset di luar daftar")
         if (off < 0) return null
-        val head = read(off, 40) ?: return fail("gagal baca header")
+        val head = read(off, 16) ?: return fail("gagal baca header")
         val hb = ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN)
-        var shift = -1
-        for (s in intArrayOf(0, 8)) {
-            if ((hb.getShort(s + 4).toInt() and 0xFFFF) == e.w && (hb.getShort(s + 6).toInt() and 0x7FFF) == e.h) { shift = s; break }
-        }
-        if (shift < 0) return fail("header tidak cocok dengan .txt")
-        val hm = hb.getShort(shift + 6).toInt() and 0xFFFF
-        val size = hb.getInt(shift + 8)
-        val rle = hb.getInt(shift + 12)
-        if (size <= 0 || size > 48_000_000) return fail("ukuran data aneh: $size")
-        val raw = read(off + shift + 16, size) ?: return fail("gagal baca data")
-        val noMips = (hm and 0x8000) != 0
-        val mips = ArrayList<IntArray>()
-        var mw = e.w; var mh = e.h
-        while (true) { mips.add(intArrayOf(mw, mh)); if (noMips || (mw == 1 && mh == 1)) break; mw = max(1, mw / 2); mh = max(1, mh / 2) }
+        val enc = hb.getShort(2).toInt() and 0xFFFF
+        if ((hb.getShort(4).toInt() and 0xFFFF) != e.w || (hb.getShort(6).toInt() and 0x7FFF) != e.h) return fail("header tidak cocok dengan .txt")
+        val hm = hb.getShort(6).toInt() and 0xFFFF
+        // observed layout: 12-byte header, then [RLE dword + payload]; "size" covers the RLE dword and the payload
+        val size = hb.getInt(8)
+        val rle = hb.getInt(12)
+        if (size < 4 || size > 48_000_000) return fail("ukuran data aneh: $size")
+        val raw = read(off + 16, size - 4) ?: return fail("gagal baca data")
+        val declNoMips = (hm and 0x8000) != 0
 
         val tries = ArrayList<Pair<String, ByteArray>>()
         if (rle == 0) tries.add("raw" to raw)
-        else for (s in intArrayOf(4, 2, 1, 8, 3, 16)) rleDecode(raw, rle and 0xFF, s)?.let { tries.add("rle$s" to it) }
-        val ks = kinds()
-        for ((tn, data) in tries) for (k in ks) {
-            if (data.size == mips.sumOf { levelSize(k, it[0], it[1]) }) {
-                val px = convert(k, data, e.w, e.h)
-                if (px != null) { note = "$k/$tn"; return TexData("db/$base/${e.name.lowercase()}", e.w, e.h, px) }
+        else for (sg in intArrayOf(4, 2, 1, 8, 3, 16)) rleDecode(raw, rle and 0xFF, sg)?.let { tries.add("rle$sg" to it) }
+        // encoding type is the GL format enum; 0x8D64 = GL_ETC1_RGB8_OES
+        val ks = if (enc == 0x8D64) listOf("ETC1") else kinds()
+        for (noMips in listOf(declNoMips, !declNoMips)) {
+            val mips = mipChain(e.w, e.h, noMips)
+            for ((tn, data) in tries) for (k in ks) {
+                if (data.size == mips.sumOf { levelSize(k, it[0], it[1]) }) {
+                    val px = convert(k, data, e.w, e.h)
+                    if (px != null) { note = "$k/$tn" + (if (noMips != declNoMips) "/mip" else ""); return TexData("db/$base/${e.name.lowercase()}", e.w, e.h, px) }
+                }
             }
         }
-        // lenient pass: biggest format whose first level fits in the data
         for ((tn, data) in tries) for (k in ks.sortedByDescending { levelSize(it, e.w, e.h) }) {
             if (levelSize(k, e.w, e.h) <= data.size) {
                 val px = convert(k, data, e.w, e.h)
                 if (px != null) { note = "~$k/$tn"; return TexData("db/$base/${e.name.lowercase()}", e.w, e.h, px) }
             }
         }
-        return fail("format tidak dikenali (enc=" + (hb.getShort(shift + 2).toInt() and 0xFFFF) + " rle=" + rle + " size=" + size + ")")
+        return fail("format tidak dikenali (enc=0x" + Integer.toHexString(enc) + " rle=" + rle + " size=" + size + ")")
     }
 
     fun get(name: String): TexData? = get(name.lowercase(), 0)

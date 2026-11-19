@@ -51,10 +51,10 @@ void main() {
 }"""
 private const val FS = """
 precision mediump float;
-uniform sampler2D uTex; uniform vec4 uCol; uniform float uSel;
+uniform sampler2D uTex; uniform vec4 uCol; uniform float uSel; uniform float uFlipV;
 varying vec3 vN; varying vec2 vUV; varying vec4 vC;
 void main() {
-  vec4 t = texture2D(uTex, vUV);
+  vec4 t = texture2D(uTex, vec2(vUV.x, mix(vUV.y, 1.0 - vUV.y, uFlipV)));
   if (t.a < 0.3) discard;
   float l = 0.55 + 0.45 * abs(dot(normalize(vN), normalize(vec3(0.4, -0.3, 0.85))));
   gl_FragColor = vec4(t.rgb * vC.rgb * uCol.rgb * l + uSel * vec3(0.30, 0.16, 0.0), 1.0);
@@ -74,6 +74,8 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
     @Volatile var dist = 150f
     @Volatile var viewDist = 500f
     @Volatile var hideLod = false
+    @Volatile var flipV = false
+    private var uFlip = 0
     @Volatile var glLog = ""
     @Volatile var selStream = -1
     @Volatile private var gzPos = FloatArray(3)
@@ -120,7 +122,7 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
     override fun onSurfaceCreated(unused: GL10?, config: EGLConfig?) {
         prog = program(VS, FS, listOf("aPos", "aNrm", "aUV", "aCol"))
         uVP = GLES20.glGetUniformLocation(prog, "uVP"); uM = GLES20.glGetUniformLocation(prog, "uM")
-        uTex = GLES20.glGetUniformLocation(prog, "uTex"); uCol = GLES20.glGetUniformLocation(prog, "uCol"); uSel = GLES20.glGetUniformLocation(prog, "uSel")
+        uTex = GLES20.glGetUniformLocation(prog, "uTex"); uCol = GLES20.glGetUniformLocation(prog, "uCol"); uSel = GLES20.glGetUniformLocation(prog, "uSel"); uFlip = GLES20.glGetUniformLocation(prog, "uFlipV")
         lprog = program(LVS, LFS, listOf("aPos"))
         luVP = GLES20.glGetUniformLocation(lprog, "uVP"); luCol = GLES20.glGetUniformLocation(lprog, "uCol")
         val ids = IntArray(1)
@@ -280,6 +282,7 @@ class GlScene(private val game: GameData) : GLSurfaceView.Renderer {
         GLES20.glUseProgram(prog)
         GLES20.glUniformMatrix4fv(uVP, 1, false, vp, 0)
         GLES20.glUniform1i(uTex, 0)
+        GLES20.glUniform1f(uFlip, if (flipV) 1f else 0f)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         for (a in 0..3) GLES20.glEnableVertexAttribArray(a)
 

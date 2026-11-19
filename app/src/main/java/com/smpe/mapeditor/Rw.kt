@@ -271,6 +271,14 @@ fun parseDff(data: ByteArray, tex: (String) -> TexData?): ModelData? {
             if (total + g.n > 65535) continue
             inc.add(Inc(g, worlds.getOrNull(a[0]))); total += g.n
         }
+        if (inc.isEmpty()) {
+            // some mobile DFFs have no atomic chunk: render every geometry with the root frame
+            for (gi in geos.indices) {
+                val g = geos[gi] ?: continue
+                if (total + g.n > 65535) continue
+                inc.add(Inc(g, worlds.getOrNull(0))); total += g.n
+            }
+        }
         if (inc.isEmpty()) return null
         val v = FloatArray(total * 12)
         val mn = floatArrayOf(1e9f, 1e9f, 1e9f); val mx = floatArrayOf(-1e9f, -1e9f, -1e9f)

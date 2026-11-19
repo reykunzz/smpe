@@ -221,6 +221,7 @@ fun Panel(vm: EditorVM, gl: GlScene, st: FloatArray, modifier: Modifier) {
     var step by remember { mutableFloatStateOf(1f) }
     var viewDist by remember { mutableFloatStateOf(gl.viewDist) }
     var hideLod by remember { mutableStateOf(gl.hideLod) }
+    var flipV by remember { mutableStateOf(gl.flipV) }
     val scope = rememberCoroutineScope()
     fun loadStream(all: Boolean) {
         val g = vm.game ?: return
@@ -331,6 +332,10 @@ fun Panel(vm: EditorVM, gl: GlScene, st: FloatArray, modifier: Modifier) {
             Button(onClick = { vm.picker = true }, shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) { Text("Tambah objek") }
             Text("Jarak pandang: ${viewDist.toInt()} m", style = MaterialTheme.typography.labelMedium)
             Slider(value = viewDist, onValueChange = { viewDist = it; gl.viewDist = it; gl.requestRender() }, valueRange = 150f..2500f)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Balik tekstur vertikal", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                Switch(checked = flipV, onCheckedChange = { flipV = it; gl.flipV = it; gl.requestRender() })
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Sembunyikan model LOD", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
                 Switch(checked = hideLod, onCheckedChange = { hideLod = it; gl.hideLod = it; gl.requestRender() })
