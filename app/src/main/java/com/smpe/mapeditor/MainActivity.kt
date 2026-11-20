@@ -389,9 +389,10 @@ fun App(vm: EditorVM = viewModel()) {
                         DropdownMenuItem(text = { Text("Diagnosa file game") }, onClick = {
                             menu = false
                             scope.launch(Dispatchers.IO) {
-                                vm.diag = (vm.game?.diagnose() ?: GameData.lastReport.ifEmpty { "Folder GTA SA belum dipilih." }) + "\nGL: " + (vm.gl?.glLog?.ifEmpty { "ok" } ?: "belum dibuat")
+                                vm.diag = (vm.game?.diagnose() ?: "Build: " + BUILD_TAG + "\n" + GameData.lastReport.ifEmpty { "Folder GTA SA belum dipilih." }) + "\nGL: " + (vm.gl?.glLog?.ifEmpty { "ok" } ?: "belum dibuat")
                             }
                         })
+                        DropdownMenuItem(text = { Text("Versi: " + BUILD_TAG) }, enabled = false, onClick = { })
                         DropdownMenuItem(text = { Text("Pilih folder GTA SA") }, onClick = { menu = false; pickTree.launch(null) })
                     }
                 }

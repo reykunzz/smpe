@@ -15,6 +15,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.math.sqrt
 
+const val BUILD_TAG = "r10-native-sizes"
+
 class ImgEntry(val offset: Long, val size: Int)
 class TexData(val key: String, val w: Int, val h: Int, val rgba: ByteArray)
 class PartData(val idx: ShortArray, val col: FloatArray, val tex: TexData?)
@@ -48,7 +50,7 @@ private fun ByteBuffer.str(p: Int, maxLen: Int): String {
 
 // ---------- DFF ----------
 private class MatRaw(val col: FloatArray, val tex: String?)
-private class GeoRaw(val n: Int, val pos: FloatArray, val uv: FloatArray?, val col: FloatArray?, val tri: IntArray, val mats: List<MatRaw>)
+private class GeoRaw(val n: Int, val pos: FloatArray, val uv: FloatArray?, val col: FloatArray?, val tri: IntArray, val mats: List<MatRaw>, val delta: Int = 0)
 
 private fun parseMaterial(bb: ByteBuffer, mc: Ck): MatRaw {
     val ms = bb.ck(mc.s)
@@ -196,7 +198,11 @@ private fun parseNativeGeo(bb: ByteBuffer, g: Ck, nv: Int): GeoRaw? {
     if (na <= 0 || na > 12) return null
     val stride = bb.getInt(q + 4 + 16)
     val ds = q + 4 + na * 24
-    if (stride <= 0 || ds.toLong() + stride.toLong() * nv > n.e.toLong()) return null
+    // the declared size of the 0x510 chunk is too small in these files: the real length is header + stride * vertices,
+    // and every enclosing chunk size is short by the same amount (delta)
+    val realEnd = ds.toLong() + stride.toLong() * nv
+    if (stride <= 0 || realEnd > bb.limit().toLong()) return null
+    val delta = max(0L, realEnd - n.e.toLong()).toInt()
     var pos: FloatArray? = null
     var uv: FloatArray? = null
     var col: FloatArray? = null
@@ -208,7 +214,7 @@ private fun parseNativeGeo(bb: ByteBuffer, g: Ck, nv: Int): GeoRaw? {
         if (cs == 0 || size < 1 || size > 4) continue
         when (idx) {
             0 -> if (size >= 3) pos = FloatArray(nv * 3) { nativeComp(bb, ds + (it / 3) * stride + off + (it % 3) * cs, type, norm) }
-            1 -> if (size >= 2) uv = FloatArray(nv * 2) { nativeComp(bb, ds + (it / 2) * stride + off + (it % 2) * cs, type, norm) }
+            1 -> if (size >= 2) uv = FloatArray(nv * 2) { nativeComp(bb, ds + (it / 2) * stride + off + (it % 2) * cs, type, norm) * (if (!norm && (type == 3 || type == 4)) 1f / 1024f else 1f) }
             3 -> if (size >= 3) col = FloatArray(nv * 4) {
                 val c = it % 4
                 if (c < size) nativeComp(bb, ds + (it / 4) * stride + off + c * cs, type, norm || type == 1 || type == 2) else 1f
@@ -218,7 +224,7 @@ private fun parseNativeGeo(bb: ByteBuffer, g: Ck, nv: Int): GeoRaw? {
     val p = pos ?: return null
     val tri = readBinMesh(bb, b)
     if (tri.isEmpty()) return null
-    return GeoRaw(nv, p, uv, col, tri, readMats(bb, g))
+    return GeoRaw(nv, p, uv, col, tri, readMats(bb, g), delta)
 }
 
 private fun parseFrames(bb: ByteBuffer, c: Ck, worlds: ArrayList<FloatArray>, names: ArrayList<String>) {
@@ -254,12 +260,32 @@ fun parseDff(data: ByteArray, tex: (String) -> TexData?): ModelData? {
         if (root.type != 0x10) return null
         val worlds = ArrayList<FloatArray>(); val names = ArrayList<String>()
         val geos = ArrayList<GeoRaw?>(); val atoms = ArrayList<IntArray>()
-        bb.kids(root) { c ->
+        var rp = root.s
+        while (rp + 12 <= bb.limit()) {
+            val c = bb.ck(rp) ?: break
+            var next = c.e
             when (c.type) {
                 0x0E -> parseFrames(bb, c, worlds, names)
-                0x1A -> bb.kids(c) { g -> if (g.type == 0x0F) geos.add(try { parseGeo(bb, g) } catch (e: Exception) { null }) }
+                0x1A -> {
+                    val st = bb.ck(c.s)
+                    if (st != null) {
+                        val num = bb.getInt(st.s)
+                        var gp = st.e
+                        var total = 0
+                        for (gi in 0 until num) {
+                            val g = bb.ck(gp) ?: break
+                            val gr = try { parseGeo(bb, g) } catch (e: Exception) { null }
+                            geos.add(gr)
+                            val dl = gr?.delta ?: 0
+                            total += dl
+                            gp = g.e + dl
+                        }
+                        next = c.e + total
+                    }
+                }
                 0x14 -> { val s = bb.ck(c.s); if (s != null) atoms.add(intArrayOf(bb.getInt(s.s), bb.getInt(s.s + 4))) }
             }
+            rp = next
         }
         class Inc(val g: GeoRaw, val w: FloatArray?)
         val inc = ArrayList<Inc>()
@@ -595,7 +621,7 @@ class GameData private constructor(private val fis: FileInputStream, private val
     var report: String = ""
 
     fun diagnose(): String {
-        val sb = StringBuilder(report).append("\n")
+        val sb = StringBuilder("Build: " + BUILD_TAG + "\n").append(report).append("\n")
         for (db in texdbs) sb.append(db.report(6))
         sb.append("Alasan gagal model: ").append(reasons.entries.joinToString { it.key + "=" + it.value.get() }).append("\nContoh gagal: ").append(failedNames.joinToString(", ")).append("\n")
         val dffs = imgIndex.keys.filter { it.endsWith(".dff") && !it.startsWith("lod") }.sorted()
